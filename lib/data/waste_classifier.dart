@@ -49,6 +49,22 @@ class WasteClassification {
 }
 
 class WasteClassifier {
+  // ============================================================
+  // GEMINI MODELS
+  // ============================================================
+
+  static const String _primaryModel = 'gemini-3.7-flash';
+
+  // Free-tier compatible fallback when using Gemini Developer API.
+  static const String _fallbackModel = 'gemini-3.5-flash-lite';
+
+  // Number of attempts for each model.
+  static const int _maxAttempts = 3;
+
+  // ============================================================
+  // MAIN CLASSIFICATION
+  // ============================================================
+
   static Future<WasteClassification> classify(
     Uint8List imageBytes,
   ) async {
@@ -58,10 +74,6 @@ class WasteClassifier {
     debugPrint('================================');
 
     try {
-      final model = FirebaseAI.googleAI().generativeModel(
-        model: 'gemini-3.7-flash',
-      );
-
       const prompt = '''
 You are EcoScan, an AI-powered waste classification assistant.
 
@@ -122,7 +134,6 @@ Use exactly this format:
       "steps": [
         "Empty the bottle completely.",
         "Rinse it with water.",
-        "Remove any remaining contents.",
         "Place it in the appropriate recycling bin."
       ],
       "iconType": "recycle"
@@ -132,9 +143,8 @@ Use exactly this format:
       "description": "Turn the bottle into a small plant container.",
       "steps": [
         "Clean and dry the bottle.",
-        "Cut the bottle carefully.",
-        "Add small drainage holes.",
-        "Fill it with soil and add a small plant."
+        "Prepare it safely as a container.",
+        "Add soil and a small plant."
       ],
       "iconType": "reuse"
     }
@@ -150,10 +160,10 @@ Rules:
 - hazardLevel: must be Low, Medium, High, or Unknown.
 - disposalAdvice: provide short and practical disposal advice.
 - confidence: number from 0.0 to 1.0.
-- recyclingSuggestions: provide 2 to 4 practical suggestions.
+- recyclingSuggestions: provide exactly 2 practical suggestions when the item is waste.
 - Each suggestion must have a short title.
 - Each suggestion must have a short description.
-- Each suggestion must contain 3 to 6 simple steps.
+- Each suggestion must contain 3 simple steps.
 - Steps must be easy for a normal person to follow.
 - Suggestions can include recycling, reuse, repurposing, donation, composting, or safe disposal when appropriate.
 - iconType must be one of:
@@ -191,115 +201,53 @@ Important:
 - Do not put JSON in a code block.
 ''';
 
-      final response = await model.generateContent([
-        Content.multi([
-          TextPart(prompt),
-          InlineDataPart(
-            'image/jpeg',
-            imageBytes,
-          ),
-        ]),
-      ]);
+      // ============================================================
+      // TRY PRIMARY MODEL
+      // ============================================================
 
-      final responseText = response.text;
-
-      debugPrint('Gemini request completed.');
-      debugPrint('Gemini response: $responseText');
-
-      if (responseText == null ||
-          responseText.trim().isEmpty) {
-        throw Exception(
-          'Gemini returned an empty response.',
+      try {
+        debugPrint(
+          'Trying primary model: $_primaryModel',
         );
-      }
 
-      final jsonText = _extractJson(responseText);
-
-      final decoded = jsonDecode(jsonText);
-
-      if (decoded is! Map<String, dynamic>) {
-        throw Exception(
-          'Gemini response is not a JSON object.',
+        final response = await _generateWithRetry(
+          modelName: _primaryModel,
+          prompt: prompt,
+          imageBytes: imageBytes,
         );
+
+        return _parseResponse(response);
+      } catch (primaryError) {
+        debugPrint('================================');
+        debugPrint('PRIMARY MODEL FAILED');
+        debugPrint('Model: $_primaryModel');
+        debugPrint('Error: $primaryError');
+        debugPrint('================================');
+
+        // Only use the fallback for temporary/server/rate-limit
+        // errors. Don't hide permanent errors such as malformed
+        // requests or invalid configuration.
+        if (!_isRetryableError(primaryError)) {
+          rethrow;
+        }
       }
 
-      final bool isWaste =
-          decoded['isWaste'] == true;
-
-      final String wasteType = _getString(
-        decoded['wasteType'],
-        'Unknown Waste',
-      );
-
-      final String material = _getString(
-        decoded['material'],
-        'Unknown',
-      );
-
-      final bool recyclable =
-          decoded['recyclable'] == true;
-
-      final String hazardLevel = _getString(
-        decoded['hazardLevel'],
-        'Unknown',
-      );
-
-      final String disposalAdvice = _getString(
-        decoded['disposalAdvice'],
-        'Follow your local waste disposal guidelines.',
-      );
-
-      double confidence = 0.0;
-
-      final confidenceValue =
-          decoded['confidence'];
-
-      if (confidenceValue is num) {
-        confidence =
-            confidenceValue.toDouble();
-      } else if (confidenceValue is String) {
-        confidence =
-            double.tryParse(
-                  confidenceValue,
-                ) ??
-                0.0;
-      }
-
-      confidence =
-          confidence.clamp(0.0, 1.0);
-
-      final List<RecyclingSuggestion>
-          recyclingSuggestions =
-          _parseSuggestions(
-        decoded['recyclingSuggestions'],
-      );
+      // ============================================================
+      // FALLBACK MODEL
+      // ============================================================
 
       debugPrint('================================');
-      debugPrint('ECOSCAN RESULT');
-      debugPrint('Is Waste: $isWaste');
-      debugPrint('Waste: $wasteType');
-      debugPrint('Material: $material');
-      debugPrint('Recyclable: $recyclable');
-      debugPrint('Hazard: $hazardLevel');
-      debugPrint(
-        'Confidence: ${(confidence * 100).toStringAsFixed(1)}%',
-      );
-      debugPrint(
-        'Suggestions: ${recyclingSuggestions.length}',
-      );
+      debugPrint('USING FALLBACK GEMINI MODEL');
+      debugPrint('Model: $_fallbackModel');
       debugPrint('================================');
 
-      return WasteClassification(
-        isWaste: isWaste,
-        wasteType: wasteType,
-        material: material,
-        recyclable: recyclable,
-        hazardLevel: hazardLevel,
-        disposalAdvice: disposalAdvice,
-        confidence: confidence,
-        recyclingSuggestions:
-            recyclingSuggestions,
+      final fallbackResponse = await _generateWithRetry(
+        modelName: _fallbackModel,
+        prompt: prompt,
+        imageBytes: imageBytes,
       );
+
+      return _parseResponse(fallbackResponse);
     } catch (e, stackTrace) {
       debugPrint('================================');
       debugPrint('GEMINI AI ERROR');
@@ -309,9 +257,288 @@ Important:
       debugPrint('================================');
 
       throw Exception(
-        'Gemini could not analyze the image: $e',
+        _friendlyErrorMessage(e),
       );
     }
+  }
+
+  // ============================================================
+  // GENERATE CONTENT WITH RETRY
+  // ============================================================
+
+  static Future<GenerateContentResponse> _generateWithRetry({
+    required String modelName,
+    required String prompt,
+    required Uint8List imageBytes,
+  }) async {
+    final model = FirebaseAI.googleAI().generativeModel(
+      model: modelName,
+    );
+
+    Object? lastError;
+
+    for (int attempt = 1; attempt <= _maxAttempts; attempt++) {
+      try {
+        debugPrint(
+          'Gemini request: $modelName '
+          'attempt $attempt/$_maxAttempts',
+        );
+
+        final response = await model.generateContent([
+          Content.multi([
+            TextPart(prompt),
+            InlineDataPart(
+              'image/jpeg',
+              imageBytes,
+            ),
+          ]),
+        ]);
+
+        debugPrint(
+          'Gemini request successful '
+          'using $modelName',
+        );
+
+        return response;
+      } catch (e) {
+        lastError = e;
+
+        debugPrint(
+          'Gemini request failed '
+          '($modelName, attempt $attempt): $e',
+        );
+
+        // Don't retry permanent errors.
+        if (!_isRetryableError(e)) {
+          rethrow;
+        }
+
+        // If this was the final attempt, stop.
+        if (attempt == _maxAttempts) {
+          break;
+        }
+
+        // Exponential backoff:
+        //
+        // Attempt 1 → wait 2 seconds
+        // Attempt 2 → wait 4 seconds
+        //
+        // This gives temporary Gemini server overload
+        // a chance to recover.
+        final int delaySeconds = attempt * 2;
+
+        debugPrint(
+          'Temporary Gemini error. '
+          'Retrying in $delaySeconds seconds...',
+        );
+
+        await Future.delayed(
+          Duration(seconds: delaySeconds),
+        );
+      }
+    }
+
+    throw Exception(
+      lastError?.toString() ??
+          'Gemini request failed.',
+    );
+  }
+
+  // ============================================================
+  // DETECT TEMPORARY GEMINI ERRORS
+  // ============================================================
+
+  static bool _isRetryableError(Object error) {
+    final String message =
+        error.toString().toLowerCase();
+
+    // HTTP 500 / internal server errors.
+    if (message.contains('500')) {
+      return true;
+    }
+
+    if (message.contains('internal')) {
+      return true;
+    }
+
+    // Gemini server temporarily overloaded.
+    if (message.contains('high demand')) {
+      return true;
+    }
+
+    if (message.contains('temporarily')) {
+      return true;
+    }
+
+    if (message.contains('try again later')) {
+      return true;
+    }
+
+    // Rate limiting.
+    if (message.contains('429')) {
+      return true;
+    }
+
+    if (message.contains('resource_exhausted')) {
+      return true;
+    }
+
+    if (message.contains('rate limit')) {
+      return true;
+    }
+
+    if (message.contains('quota')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  // ============================================================
+  // PARSE GEMINI RESPONSE
+  // ============================================================
+
+  static WasteClassification _parseResponse(
+    GenerateContentResponse response,
+  ) {
+    final responseText = response.text;
+
+    debugPrint('Gemini request completed.');
+    debugPrint('Gemini response: $responseText');
+
+    if (responseText == null ||
+        responseText.trim().isEmpty) {
+      throw Exception(
+        'Gemini returned an empty response.',
+      );
+    }
+
+    final jsonText = _extractJson(responseText);
+
+    final decoded = jsonDecode(jsonText);
+
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception(
+        'Gemini response is not a JSON object.',
+      );
+    }
+
+    final bool isWaste =
+        decoded['isWaste'] == true;
+
+    final String wasteType = _getString(
+      decoded['wasteType'],
+      'Unknown Waste',
+    );
+
+    final String material = _getString(
+      decoded['material'],
+      'Unknown',
+    );
+
+    final bool recyclable =
+        decoded['recyclable'] == true;
+
+    final String hazardLevel = _getString(
+      decoded['hazardLevel'],
+      'Unknown',
+    );
+
+    final String disposalAdvice = _getString(
+      decoded['disposalAdvice'],
+      'Follow your local waste disposal guidelines.',
+    );
+
+    double confidence = 0.0;
+
+    final confidenceValue =
+        decoded['confidence'];
+
+    if (confidenceValue is num) {
+      confidence =
+          confidenceValue.toDouble();
+    } else if (confidenceValue is String) {
+      confidence =
+          double.tryParse(
+                confidenceValue,
+              ) ??
+              0.0;
+    }
+
+    confidence =
+        confidence.clamp(0.0, 1.0);
+
+    final List<RecyclingSuggestion>
+        recyclingSuggestions =
+        _parseSuggestions(
+      decoded['recyclingSuggestions'],
+    );
+
+    debugPrint('================================');
+    debugPrint('ECOSCAN RESULT');
+    debugPrint('Is Waste: $isWaste');
+    debugPrint('Waste: $wasteType');
+    debugPrint('Material: $material');
+    debugPrint('Recyclable: $recyclable');
+    debugPrint('Hazard: $hazardLevel');
+    debugPrint(
+      'Confidence: ${(confidence * 100).toStringAsFixed(1)}%',
+    );
+    debugPrint(
+      'Suggestions: ${recyclingSuggestions.length}',
+    );
+    debugPrint('================================');
+
+    return WasteClassification(
+      isWaste: isWaste,
+      wasteType: wasteType,
+      material: material,
+      recyclable: recyclable,
+      hazardLevel: hazardLevel,
+      disposalAdvice: disposalAdvice,
+      confidence: confidence,
+      recyclingSuggestions:
+          recyclingSuggestions,
+    );
+  }
+
+  // ============================================================
+  // FRIENDLY ERROR MESSAGE
+  // ============================================================
+
+  static String _friendlyErrorMessage(
+    Object error,
+  ) {
+    final String message =
+        error.toString().toLowerCase();
+
+    if (message.contains('high demand') ||
+        message.contains('500') ||
+        message.contains('internal')) {
+      return 'Gemini is temporarily busy. '
+          'Please try scanning again in a moment.';
+    }
+
+    if (message.contains('429') ||
+        message.contains('quota') ||
+        message.contains('rate limit') ||
+        message.contains('resource_exhausted')) {
+      return 'The AI scan limit has been reached temporarily. '
+          'Please try again later.';
+    }
+
+    if (message.contains('empty response')) {
+      return 'Gemini returned an empty response. '
+          'Please try scanning again.';
+    }
+
+    if (message.contains('json')) {
+      return 'EcoScan received an invalid AI response. '
+          'Please try scanning again.';
+    }
+
+    return 'Gemini could not analyze the image. '
+        'Please try again.';
   }
 
   // ============================================================
