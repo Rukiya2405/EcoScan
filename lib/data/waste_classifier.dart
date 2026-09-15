@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:firebase_ai/firebase_ai.dart';
 import 'package:flutter/foundation.dart';
+import 'package:image/image.dart' as img;
 
 class RecyclingSuggestion {
   final String title;
@@ -33,7 +34,6 @@ class WasteClassification {
   final String hazardLevel;
   final String disposalAdvice;
   final double confidence;
-
   final List<RecyclingSuggestion> recyclingSuggestions;
 
   WasteClassification({
@@ -50,16 +50,75 @@ class WasteClassification {
 
 class WasteClassifier {
   // ============================================================
-  // GEMINI MODELS
+  // GEMINI MODEL
   // ============================================================
 
-  static const String _primaryModel = 'gemini-3.7-flash';
+  static const String _modelName = 'gemini-2.0-flash-exp';
 
-  // Free-tier compatible fallback when using Gemini Developer API.
-  static const String _fallbackModel = 'gemini-3.5-flash-lite';
+  // ============================================================
+  // IMAGE PREPROCESSING
+  // ============================================================
 
-  // Number of attempts for each model.
-  static const int _maxAttempts = 3;
+  static Future<Uint8List> _preprocessImage(
+    Uint8List imageBytes,
+  ) async {
+    debugPrint('');
+    debugPrint('========================================');
+    debugPrint('IMAGE PREPROCESSING');
+    debugPrint('========================================');
+    debugPrint('Original size: ${imageBytes.length} bytes');
+
+    try {
+      // Decode the image
+      img.Image? image = img.decodeImage(imageBytes);
+
+      if (image == null) {
+        debugPrint('Failed to decode image, using original');
+        return imageBytes;
+      }
+
+      debugPrint('Original dimensions: ${image.width}x${image.height}');
+
+      // Fix orientation based on EXIF data
+      // This is critical for photos taken with real phone cameras
+      image = img.bakeOrientation(image);
+      debugPrint('Applied EXIF orientation correction');
+
+      // Resize if too large (max dimension 1536px)
+      const int maxDimension = 1536;
+      if (image.width > maxDimension || image.height > maxDimension) {
+        if (image.width > image.height) {
+          image = img.copyResize(
+            image,
+            width: maxDimension,
+          );
+        } else {
+          image = img.copyResize(
+            image,
+            height: maxDimension,
+          );
+        }
+        debugPrint('Resized to: ${image.width}x${image.height}');
+      }
+
+      // Encode as JPEG with good quality
+      final processedBytes = Uint8List.fromList(
+        img.encodeJpg(image, quality: 85),
+      );
+
+      debugPrint('Processed size: ${processedBytes.length} bytes');
+      debugPrint('Size reduction: ${((1 - processedBytes.length / imageBytes.length) * 100).toStringAsFixed(1)}%');
+      debugPrint('========================================');
+
+      return processedBytes;
+    } catch (e, stackTrace) {
+      debugPrint('Image preprocessing error: $e');
+      debugPrint('Stack trace: $stackTrace');
+      debugPrint('Using original image');
+      debugPrint('========================================');
+      return imageBytes;
+    }
+  }
 
   // ============================================================
   // MAIN CLASSIFICATION
@@ -68,193 +127,164 @@ class WasteClassifier {
   static Future<WasteClassification> classify(
     Uint8List imageBytes,
   ) async {
-    debugPrint('================================');
-    debugPrint('ECOSCAN GEMINI AI');
-    debugPrint('Image size: ${imageBytes.length} bytes');
-    debugPrint('================================');
+    debugPrint('');
+    debugPrint('========================================');
+    debugPrint('ECOSCAN AI SCAN');
+    debugPrint('========================================');
+    debugPrint('Input image size: ${imageBytes.length} bytes');
+    debugPrint('Model: $_modelName');
 
     try {
+      // Preprocess the image to fix orientation and size issues
+      final processedImage = await _preprocessImage(imageBytes);
+
       const prompt = '''
 You are EcoScan, an AI-powered waste classification assistant.
 
-Analyze the image carefully.
+Analyze the image carefully and identify ALL types of waste materials.
 
-Your FIRST job is to determine whether the main visible object is actually waste.
+Your first job is to determine whether the main visible object is actually waste.
 
-Examples of waste:
-- Plastic bottles
-- Plastic containers
-- Plastic bags
-- Cans
-- Glass bottles
-- Glass containers
-- Paper
-- Cardboard
-- Food waste
-- Electronic waste
-- Batteries
-- Metal objects that are being discarded
+Examples of waste (you can identify ALL of these):
+
+- Plastic bottles, containers, bags, wrappers, cups, straws
+- Aluminum cans, tin cans, metal containers
+- Glass bottles, jars, broken glass
+- Paper (newspapers, magazines, office paper, notebooks)
+- Cardboard boxes, packaging
+- Food waste (fruit peels, vegetable scraps, leftovers, eggshells)
+- Electronic waste (old phones, computers, cables, batteries)
+- Batteries (alkaline, lithium, rechargeable)
+- Styrofoam containers and packaging
+- Tetra packs (juice boxes, milk cartons)
+- Fabric and textile waste
+- Wood scraps
+- Rubber items
+- Mixed materials
 - Other clearly discarded waste items
 
 Examples that are NOT waste:
-- People
-- Animals
-- Cars
-- Buildings
-- Trees
-- Plants
-- Furniture that is not clearly being discarded
+
+- People, animals, cars, buildings
+- Trees, plants, landscapes
+- Furniture or objects that are not clearly being discarded
 - Clothing that is being worn
-- Food that is being eaten or served
-- Normal household objects that are not clearly waste
-- Landscapes
-- Screenshots
-- Random objects that cannot reasonably be identified as waste
+- Food that is being served or eaten fresh
+- Normal household objects in use
+- Screenshots, text documents
 
-If the image does NOT contain a clear waste item, set "isWaste" to false.
+If the image does NOT contain a clear waste item:
 
-If the image DOES contain a clear waste item, set "isWaste" to true.
+isWaste must be false.
+
+If the image DOES contain a clear waste item:
+
+isWaste must be true.
 
 Return ONLY valid JSON.
 
-Use exactly this format:
+Use exactly this structure:
 
 {
   "isWaste": true,
   "wasteType": "Plastic bottle",
-  "material": "Plastic",
+  "material": "Plastic (PET)",
   "recyclable": true,
   "hazardLevel": "Low",
-  "disposalAdvice": "Empty and rinse the bottle before placing it in the recycling bin.",
+  "disposalAdvice": "Empty and rinse the bottle before placing it in the recycling bin for plastics.",
   "confidence": 0.95,
   "recyclingSuggestions": [
     {
-      "title": "Recycle the bottle",
-      "description": "Prepare the bottle properly for recycling.",
+      "title": "Recycle properly",
+      "description": "Prepare the item for recycling.",
       "steps": [
-        "Empty the bottle completely.",
-        "Rinse it with water.",
-        "Place it in the appropriate recycling bin."
+        "Empty the container completely",
+        "Rinse with water to remove residue",
+        "Place in the appropriate recycling bin"
       ],
       "iconType": "recycle"
     },
     {
-      "title": "Reuse as a planter",
-      "description": "Turn the bottle into a small plant container.",
+      "title": "Creative reuse",
+      "description": "Give the item a second life.",
       "steps": [
-        "Clean and dry the bottle.",
-        "Prepare it safely as a container.",
-        "Add soil and a small plant."
+        "Clean and dry the item thoroughly",
+        "Use as a storage container or planter",
+        "Get creative with DIY projects"
       ],
-      "iconType": "reuse"
+      "iconType": "creative"
     }
   ]
 }
 
 Rules:
 
-- isWaste: must be true or false.
-- wasteType: identify the main visible waste item.
-- material: identify the main material.
-- recyclable: must be true or false.
-- hazardLevel: must be Low, Medium, High, or Unknown.
-- disposalAdvice: provide short and practical disposal advice.
-- confidence: number from 0.0 to 1.0.
-- recyclingSuggestions: provide exactly 2 practical suggestions when the item is waste.
-- Each suggestion must have a short title.
-- Each suggestion must have a short description.
-- Each suggestion must contain 3 simple steps.
-- Steps must be easy for a normal person to follow.
-- Suggestions can include recycling, reuse, repurposing, donation, composting, or safe disposal when appropriate.
-- iconType must be one of:
-  "recycle",
-  "clean",
-  "reuse",
-  "creative",
-  "dispose".
+- isWaste must be true or false
+- wasteType must identify the specific waste item (be specific: "Plastic water bottle", "Aluminum soda can", "Banana peel", etc.)
+- material must identify the main material (Plastic, Metal, Glass, Paper, Cardboard, Organic, Electronic, etc.)
+- recyclable must be true or false
+- hazardLevel must be Low, Medium, High, or Unknown
+- disposalAdvice must be short, practical, and location-appropriate
+- confidence must be between 0.0 and 1.0
+- Provide exactly 2 recyclingSuggestions when the item is waste
+- Each suggestion must have 3 simple, safe steps
+- iconType must be one of: recycle, clean, reuse, creative, dispose
 
-If the image is not waste:
+If the image is NOT waste:
 
-- isWaste must be false.
-- wasteType must be "Unknown".
-- material must be "Unknown".
-- recyclable must be false.
-- hazardLevel must be "Unknown".
-- disposalAdvice must be "Please scan a waste item."
-- recyclingSuggestions must be an empty array.
-
-If the image is unclear and you cannot determine whether it is waste:
-
-- isWaste must be false.
-- recyclingSuggestions must be an empty array.
-- Do not guess.
+{
+  "isWaste": false,
+  "wasteType": "Unknown",
+  "material": "Unknown",
+  "recyclable": false,
+  "hazardLevel": "Unknown",
+  "disposalAdvice": "Please scan a waste item.",
+  "confidence": 0.0,
+  "recyclingSuggestions": []
+}
 
 Important:
 
-- Focus on the main object.
-- Do not invent information.
-- Make recycling suggestions appropriate for the detected material.
-- Do not recommend unsafe activities.
-- Do not tell users to cut, burn, break, or chemically modify hazardous materials.
-- Return JSON only.
-- Do not use Markdown.
-- Do not put JSON in a code block.
+- You CAN identify all types of waste, not just plastic bottles
+- Be confident in your classification
+- Focus on the main object in the image
+- Do not invent information
+- Do not recommend unsafe activities
+- Return JSON only, no Markdown, no code blocks
 ''';
 
-      // ============================================================
-      // TRY PRIMARY MODEL
-      // ============================================================
+      debugPrint('');
+      debugPrint('Sending image to Gemini...');
+      debugPrint('');
 
-      try {
-        debugPrint(
-          'Trying primary model: $_primaryModel',
-        );
-
-        final response = await _generateWithRetry(
-          modelName: _primaryModel,
-          prompt: prompt,
-          imageBytes: imageBytes,
-        );
-
-        return _parseResponse(response);
-      } catch (primaryError) {
-        debugPrint('================================');
-        debugPrint('PRIMARY MODEL FAILED');
-        debugPrint('Model: $_primaryModel');
-        debugPrint('Error: $primaryError');
-        debugPrint('================================');
-
-        // Only use the fallback for temporary/server/rate-limit
-        // errors. Don't hide permanent errors such as malformed
-        // requests or invalid configuration.
-        if (!_isRetryableError(primaryError)) {
-          rethrow;
-        }
-      }
-
-      // ============================================================
-      // FALLBACK MODEL
-      // ============================================================
-
-      debugPrint('================================');
-      debugPrint('USING FALLBACK GEMINI MODEL');
-      debugPrint('Model: $_fallbackModel');
-      debugPrint('================================');
-
-      final fallbackResponse = await _generateWithRetry(
-        modelName: _fallbackModel,
-        prompt: prompt,
-        imageBytes: imageBytes,
+      final model = FirebaseAI.googleAI().generativeModel(
+        model: _modelName,
       );
 
-      return _parseResponse(fallbackResponse);
+      final response = await model.generateContent([
+        Content.multi([
+          TextPart(prompt),
+          InlineDataPart(
+            'image/jpeg',
+            processedImage,
+          ),
+        ]),
+      ]);
+
+      debugPrint('Gemini response received.');
+
+      return _parseResponse(response);
     } catch (e, stackTrace) {
-      debugPrint('================================');
-      debugPrint('GEMINI AI ERROR');
+      debugPrint('');
+      debugPrint('========================================');
+      debugPrint('ECOSCAN GEMINI ERROR');
+      debugPrint('========================================');
       debugPrint('Error type: ${e.runtimeType}');
       debugPrint('Error: $e');
-      debugPrint('Stack trace: $stackTrace');
-      debugPrint('================================');
+      debugPrint('');
+      debugPrint('Stack trace:');
+      debugPrint(stackTrace.toString());
+      debugPrint('========================================');
 
       throw Exception(
         _friendlyErrorMessage(e),
@@ -263,135 +293,85 @@ Important:
   }
 
   // ============================================================
-  // GENERATE CONTENT WITH RETRY
+  // FRIENDLY ERROR MESSAGE
   // ============================================================
 
-  static Future<GenerateContentResponse> _generateWithRetry({
-    required String modelName,
-    required String prompt,
-    required Uint8List imageBytes,
-  }) async {
-    final model = FirebaseAI.googleAI().generativeModel(
-      model: modelName,
-    );
+  static String _friendlyErrorMessage(
+    Object error,
+  ) {
+    final String message = error.toString().toLowerCase();
 
-    Object? lastError;
+    // ----------------------------------------------------------
+    // QUOTA
+    // ----------------------------------------------------------
 
-    for (int attempt = 1; attempt <= _maxAttempts; attempt++) {
-      try {
-        debugPrint(
-          'Gemini request: $modelName '
-          'attempt $attempt/$_maxAttempts',
-        );
-
-        final response = await model.generateContent([
-          Content.multi([
-            TextPart(prompt),
-            InlineDataPart(
-              'image/jpeg',
-              imageBytes,
-            ),
-          ]),
-        ]);
-
-        debugPrint(
-          'Gemini request successful '
-          'using $modelName',
-        );
-
-        return response;
-      } catch (e) {
-        lastError = e;
-
-        debugPrint(
-          'Gemini request failed '
-          '($modelName, attempt $attempt): $e',
-        );
-
-        // Don't retry permanent errors.
-        if (!_isRetryableError(e)) {
-          rethrow;
-        }
-
-        // If this was the final attempt, stop.
-        if (attempt == _maxAttempts) {
-          break;
-        }
-
-        // Exponential backoff:
-        //
-        // Attempt 1 → wait 2 seconds
-        // Attempt 2 → wait 4 seconds
-        //
-        // This gives temporary Gemini server overload
-        // a chance to recover.
-        final int delaySeconds = attempt * 2;
-
-        debugPrint(
-          'Temporary Gemini error. '
-          'Retrying in $delaySeconds seconds...',
-        );
-
-        await Future.delayed(
-          Duration(seconds: delaySeconds),
-        );
-      }
+    if (message.contains('quota') ||
+        message.contains('resource_exhausted') ||
+        message.contains('rate limit') ||
+        message.contains('429') ||
+        message.contains('free_tier')) {
+      return 'The AI scan limit has been reached. '
+          'Please wait for the Gemini quota to reset '
+          'or check your Gemini API billing and limits.';
     }
 
-    throw Exception(
-      lastError?.toString() ??
-          'Gemini request failed.',
-    );
-  }
+    // ----------------------------------------------------------
+    // APP CHECK
+    // ----------------------------------------------------------
 
-  // ============================================================
-  // DETECT TEMPORARY GEMINI ERRORS
-  // ============================================================
-
-  static bool _isRetryableError(Object error) {
-    final String message =
-        error.toString().toLowerCase();
-
-    // HTTP 500 / internal server errors.
-    if (message.contains('500')) {
-      return true;
+    if (message.contains('app attestation failed') ||
+        message.contains('firebase_app_check') ||
+        message.contains('403')) {
+      return 'Firebase App Check rejected this request. '
+          'Please check your App Check configuration.';
     }
 
-    if (message.contains('internal')) {
-      return true;
+    // ----------------------------------------------------------
+    // PERMISSION
+    // ----------------------------------------------------------
+
+    if (message.contains('permission denied') ||
+        message.contains('unauthenticated') ||
+        message.contains('unauthorized')) {
+      return 'Gemini access was denied. '
+          'Please check your Firebase AI configuration.';
     }
 
-    // Gemini server temporarily overloaded.
-    if (message.contains('high demand')) {
-      return true;
+    // ----------------------------------------------------------
+    // NETWORK
+    // ----------------------------------------------------------
+
+    if (message.contains('network') ||
+        message.contains('socket') ||
+        message.contains('connection')) {
+      return 'Network connection failed. '
+          'Please check your internet connection and try again.';
     }
 
-    if (message.contains('temporarily')) {
-      return true;
+    // ----------------------------------------------------------
+    // EMPTY RESPONSE
+    // ----------------------------------------------------------
+
+    if (message.contains('empty response')) {
+      return 'Gemini returned an empty response. '
+          'Please try scanning again.';
     }
 
-    if (message.contains('try again later')) {
-      return true;
+    // ----------------------------------------------------------
+    // JSON
+    // ----------------------------------------------------------
+
+    if (message.contains('json')) {
+      return 'EcoScan received an invalid AI response. '
+          'Please try scanning again.';
     }
 
-    // Rate limiting.
-    if (message.contains('429')) {
-      return true;
-    }
+    // ----------------------------------------------------------
+    // DEFAULT
+    // ----------------------------------------------------------
 
-    if (message.contains('resource_exhausted')) {
-      return true;
-    }
-
-    if (message.contains('rate limit')) {
-      return true;
-    }
-
-    if (message.contains('quota')) {
-      return true;
-    }
-
-    return false;
+    return 'Gemini could not analyze the image. '
+        'Please try again.';
   }
 
   // ============================================================
@@ -401,21 +381,24 @@ Important:
   static WasteClassification _parseResponse(
     GenerateContentResponse response,
   ) {
-    final responseText = response.text;
+    final String? responseText = response.text;
 
-    debugPrint('Gemini request completed.');
-    debugPrint('Gemini response: $responseText');
+    debugPrint('');
+    debugPrint('========================================');
+    debugPrint('GEMINI RESPONSE');
+    debugPrint('========================================');
+    debugPrint(responseText ?? '(empty)');
+    debugPrint('========================================');
 
-    if (responseText == null ||
-        responseText.trim().isEmpty) {
+    if (responseText == null || responseText.trim().isEmpty) {
       throw Exception(
         'Gemini returned an empty response.',
       );
     }
 
-    final jsonText = _extractJson(responseText);
+    final String jsonText = _extractJson(responseText);
 
-    final decoded = jsonDecode(jsonText);
+    final dynamic decoded = jsonDecode(jsonText);
 
     if (decoded is! Map<String, dynamic>) {
       throw Exception(
@@ -423,12 +406,11 @@ Important:
       );
     }
 
-    final bool isWaste =
-        decoded['isWaste'] == true;
+    final bool isWaste = decoded['isWaste'] == true;
 
     final String wasteType = _getString(
       decoded['wasteType'],
-      'Unknown Waste',
+      'Unknown',
     );
 
     final String material = _getString(
@@ -436,8 +418,7 @@ Important:
       'Unknown',
     );
 
-    final bool recyclable =
-        decoded['recyclable'] == true;
+    final bool recyclable = decoded['recyclable'] == true;
 
     final String hazardLevel = _getString(
       decoded['hazardLevel'],
@@ -446,36 +427,30 @@ Important:
 
     final String disposalAdvice = _getString(
       decoded['disposalAdvice'],
-      'Follow your local waste disposal guidelines.',
+      'Please follow your local waste disposal guidelines.',
     );
 
     double confidence = 0.0;
 
-    final confidenceValue =
-        decoded['confidence'];
+    final dynamic confidenceValue = decoded['confidence'];
 
     if (confidenceValue is num) {
-      confidence =
-          confidenceValue.toDouble();
+      confidence = confidenceValue.toDouble();
     } else if (confidenceValue is String) {
-      confidence =
-          double.tryParse(
-                confidenceValue,
-              ) ??
-              0.0;
+      confidence = double.tryParse(confidenceValue) ?? 0.0;
     }
 
-    confidence =
-        confidence.clamp(0.0, 1.0);
+    confidence = confidence.clamp(0.0, 1.0);
 
-    final List<RecyclingSuggestion>
-        recyclingSuggestions =
+    final List<RecyclingSuggestion> recyclingSuggestions =
         _parseSuggestions(
       decoded['recyclingSuggestions'],
     );
 
-    debugPrint('================================');
+    debugPrint('');
+    debugPrint('========================================');
     debugPrint('ECOSCAN RESULT');
+    debugPrint('========================================');
     debugPrint('Is Waste: $isWaste');
     debugPrint('Waste: $wasteType');
     debugPrint('Material: $material');
@@ -487,7 +462,7 @@ Important:
     debugPrint(
       'Suggestions: ${recyclingSuggestions.length}',
     );
-    debugPrint('================================');
+    debugPrint('========================================');
 
     return WasteClassification(
       isWaste: isWaste,
@@ -497,56 +472,15 @@ Important:
       hazardLevel: hazardLevel,
       disposalAdvice: disposalAdvice,
       confidence: confidence,
-      recyclingSuggestions:
-          recyclingSuggestions,
+      recyclingSuggestions: recyclingSuggestions,
     );
   }
 
   // ============================================================
-  // FRIENDLY ERROR MESSAGE
+  // PARSE SUGGESTIONS
   // ============================================================
 
-  static String _friendlyErrorMessage(
-    Object error,
-  ) {
-    final String message =
-        error.toString().toLowerCase();
-
-    if (message.contains('high demand') ||
-        message.contains('500') ||
-        message.contains('internal')) {
-      return 'Gemini is temporarily busy. '
-          'Please try scanning again in a moment.';
-    }
-
-    if (message.contains('429') ||
-        message.contains('quota') ||
-        message.contains('rate limit') ||
-        message.contains('resource_exhausted')) {
-      return 'The AI scan limit has been reached temporarily. '
-          'Please try again later.';
-    }
-
-    if (message.contains('empty response')) {
-      return 'Gemini returned an empty response. '
-          'Please try scanning again.';
-    }
-
-    if (message.contains('json')) {
-      return 'EcoScan received an invalid AI response. '
-          'Please try scanning again.';
-    }
-
-    return 'Gemini could not analyze the image. '
-        'Please try again.';
-  }
-
-  // ============================================================
-  // PARSE RECYCLING SUGGESTIONS
-  // ============================================================
-
-  static List<RecyclingSuggestion>
-      _parseSuggestions(dynamic value) {
+  static List<RecyclingSuggestion> _parseSuggestions(dynamic value) {
     if (value is! List) {
       return [];
     }
@@ -570,13 +504,11 @@ Important:
 
       final List<String> steps = [];
 
-      final dynamic stepsValue =
-          item['steps'];
+      final dynamic stepsValue = item['steps'];
 
       if (stepsValue is List) {
         for (final step in stepsValue) {
-          final String stepText =
-              step.toString().trim();
+          final String stepText = step.toString().trim();
 
           if (stepText.isNotEmpty) {
             steps.add(stepText);
@@ -590,8 +522,7 @@ Important:
         );
       }
 
-      final IconType iconType =
-          _parseIconType(
+      final IconType iconType = _parseIconType(
         item['iconType'],
       );
 
@@ -615,9 +546,7 @@ Important:
   static IconType _parseIconType(
     dynamic value,
   ) {
-    final String type =
-        value?.toString().toLowerCase().trim() ??
-            '';
+    final String type = value?.toString().toLowerCase().trim() ?? '';
 
     switch (type) {
       case 'clean':
@@ -650,8 +579,7 @@ Important:
       return fallback;
     }
 
-    final String result =
-        value.toString().trim();
+    final String result = value.toString().trim();
 
     if (result.isEmpty) {
       return fallback;
@@ -670,31 +598,23 @@ Important:
     String cleaned = text.trim();
 
     if (cleaned.startsWith('```json')) {
-      cleaned =
-          cleaned.substring(7).trim();
+      cleaned = cleaned.substring(7).trim();
     } else if (cleaned.startsWith('```')) {
-      cleaned =
-          cleaned.substring(3).trim();
+      cleaned = cleaned.substring(3).trim();
     }
 
     if (cleaned.endsWith('```')) {
-      cleaned = cleaned
-          .substring(
-            0,
-            cleaned.length - 3,
-          )
-          .trim();
+      cleaned = cleaned.substring(
+        0,
+        cleaned.length - 3,
+      ).trim();
     }
 
-    final int start =
-        cleaned.indexOf('{');
+    final int start = cleaned.indexOf('{');
 
-    final int end =
-        cleaned.lastIndexOf('}');
+    final int end = cleaned.lastIndexOf('}');
 
-    if (start != -1 &&
-        end != -1 &&
-        end > start) {
+    if (start != -1 && end != -1 && end > start) {
       cleaned = cleaned.substring(
         start,
         end + 1,
