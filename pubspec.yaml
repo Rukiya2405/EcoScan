@@ -20,13 +20,14 @@ dependencies:
   cloud_firestore: ^6.9.0
   firebase_messaging: ^16.6.0
   flutter_local_notifications: ^18.0.0
-  firebase_storage: 13.5.0        # ADD THIS
+  firebase_storage: ^13.5.0
 
   geolocator: ^14.0.3
   google_maps_flutter: ^2.18.0
-  firebase_ai: ^4.0.0
-  firebase_app_check: ^0.4.7
+
+  firebase_app_check: ^0.4.8
   image: ^4.10.1
+  firebase_ai: ^4.0.0
 
 dev_dependencies:
   flutter_test:
